@@ -1,0 +1,230 @@
+name: Flutter SDK slim release
+
+# Mengunduh flutter_<tag>-<rel>_aarch64.deb dari GeneralKaos666/flutter-for-termux,
+# memverifikasi hash, membuang bagian yang jelas tidak dipakai build APK, lalu
+# merilis arsip .tar.xz (layout: flutter/...) ke repo ini.
+# Letakkan di .github/workflows/ lalu jalankan manual (Actions > Run workflow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag rilis Flutter di repo sumber"
+        default: "3.47.7"
+        required: true
+      pkg_rel:
+        description: "Revisi paket (angka setelah tanda minus)"
+        default: "6"
+        required: true
+      keep_git:
+        description: "Pertahankan folder .git (490 MiB). Aktifkan hanya bila tool Flutter ternyata butuh git"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  slim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ inputs.tag }}
+      PKG_REL: ${{ inputs.pkg_rel }}
+      KEEP_GIT: ${{ inputs.keep_git }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download and verify the deb
+        run: |
+          set -euo pipefail
+          deb="flutter_${TAG}-${PKG_REL}_aarch64.deb"
+          base="https://github.com/GeneralKaos666/flutter-for-termux/releases/download/${TAG}"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$deb" "$base/$deb"
+          curl -fsSL --retry 3 -o "$deb.sha256" "$base/$deb.sha256"
+          curl -fsSL --retry 3 -o "$deb.size.txt" "$base/$deb.size.txt"
+          actual_size=$(stat -c %s "$deb")
+          actual_sha=$(sha256sum "$deb" | cut -d' ' -f1)
+          rel_sha=$(grep -oE '[0-9a-f]{64}' "$deb.sha256" | sed -n '1p')
+          rel_size=$(tr -dc '0-9' < "$deb.size.txt")
+          echo "deb size=$actual_size sha256=$actual_sha"
+          [ "$actual_sha" = "$rel_sha" ] || { echo "::error::SHA-256 differs from the release .sha256 file"; exit 1; }
+          [ "$actual_size" = "$rel_size" ] || { echo "::error::Size differs from the release .size.txt file"; exit 1; }
+          {
+            echo "DEB=$deb"
+            echo "DEB_SHA=$actual_sha"
+            echo "DEB_SIZE=$actual_size"
+          } >> "$GITHUB_ENV"
+
+      - name: Extract
+        run: |
+          set -euo pipefail
+          mkdir sdk
+          dpkg-deb -x "$DEB" sdk
+          root="$PWD/sdk/data/data/com.termux/files/usr/opt/flutter"
+          test -d "$root" || { echo "::error::Flutter root not found"; exit 1; }
+          echo "ROOT=$root" >> "$GITHUB_ENV"
+          echo "SHARE=$PWD/sdk/data/data/com.termux/files/usr/share/flutter" >> "$GITHUB_ENV"
+          echo "SIZE_BEFORE_KB=$(du -sk "$root" | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Remove what a Studio Mobile APK build does not need
+        run: |
+          set -eu
+          : > removed.txt
+          rm_path() {
+            p="$ROOT/$1"
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              kb=$(du -sk "$p" | cut -f1)
+              rm -rf "$p"
+              printf '%8.1f MiB  %s\n' "$(awk -v k="$kb" 'BEGIN{print k/1024}')" "$1" >> removed.txt
+            else
+              printf '%12s  %s\n' "(not found)" "$1" >> removed.txt
+            fi
+          }
+
+          # Riwayat git: hanya dibuang bila tidak diminta tetap ada.
+          if [ "$KEEP_GIT" != "true" ]; then rm_path ".git"; fi
+
+          # Alat Dart untuk analisis, web, dan devtools. Build APK tidak memakainya.
+          # dartdev_aot, frontend_server_aot, gen_kernel_aot, kernel_worker_aot sengaja DIPERTAHANKAN
+          # (dipakai oleh "dart pub get" dan kompilasi kernel).
+          D="bin/cache/dart-sdk/bin"
+          rm_path "$D/resources/devtools"
+          rm_path "$D/snapshots/analysis_server.dart.snapshot"
+          rm_path "$D/snapshots/analysis_server_aot.dart.snapshot"
+          rm_path "$D/snapshots/dart2js_aot.dart.snapshot"
+          rm_path "$D/snapshots/dart2wasm_product.snapshot"
+          rm_path "$D/snapshots/dartdevc.dart.snapshot"
+          rm_path "$D/snapshots/dartdevc_aot.dart.snapshot"
+          rm_path "bin/cache/dart-sdk/lib/_internal/ddc_platform.dill"
+          rm_path "bin/cache/dart-sdk/lib/_internal/dart2js_platform.dill"
+          rm_path "bin/cache/dart-sdk/lib/_internal/dart2wasm_platform.dill"
+
+          # Tes, contoh, dan benchmark milik Flutter sendiri.
+          rm_path "packages/flutter/test"
+          rm_path "packages/flutter_tools/test"
+          rm_path "examples"
+          rm_path "dev/integration_tests"
+          rm_path "dev/benchmarks"
+
+          echo "SIZE_AFTER_KB=$(du -sk "$ROOT" | cut -f1)" >> "$GITHUB_ENV"
+          cat removed.txt
+
+      - name: Sanity check - files the build needs must still exist
+        run: |
+          set -eu
+          missing=0
+          for f in \
+            bin/flutter \
+            bin/internal/engine.version \
+            bin/cache/dart-sdk/bin/dart \
+            bin/cache/dart-sdk/bin/snapshots/dartdev_aot.dart.snapshot \
+            bin/cache/dart-sdk/bin/snapshots/frontend_server_aot.dart.snapshot \
+            bin/cache/dart-sdk/lib/_internal/vm_platform_strong.dill \
+            bin/cache/artifacts/engine/linux-arm64/gen_snapshot \
+            bin/cache/artifacts/engine/linux-arm64/frontend_server_aot.dart.snapshot \
+            bin/cache/artifacts/engine/linux-arm64/impellerc \
+            bin/cache/artifacts/engine/common/flutter_patched_sdk_product/platform_strong.dill \
+            packages/flutter/lib/widgets.dart \
+            packages/flutter_tools/lib/executable.dart \
+            packages/flutter_tools/gradle; do
+            if [ -e "$ROOT/$f" ]; then echo "ok       $f"; else echo "MISSING  $f"; missing=1; fi
+          done
+          [ "$missing" = 0 ] || { echo "::error::A required file is missing, so the slimming went too far or the layout differs"; exit 1; }
+
+      - name: Symlinks (informational)
+        run: |
+          set -u
+          n=$(find "$ROOT" -type l | wc -l)
+          echo "symlinks: $n"
+          find "$ROOT" -type l -printf '%P -> %l\n' | sed -n '1,30p'
+
+      - name: Create the archive
+        run: |
+          set -euo pipefail
+          mkdir stage
+          mv "$ROOT" stage/flutter
+          if [ -f "$SHARE/manifest.json" ]; then cp "$SHARE/manifest.json" stage/flutter/studio-manifest.json; fi
+          out="flutter-sdk-${TAG}-arm64.tar.xz"
+          # xz -6 (kamus 8 MiB) supaya dekompresi di HP tidak boros memori.
+          tar --owner=0 --group=0 --numeric-owner --sort=name -C stage -cf - flutter | xz -6 -T0 > "$out"
+          size=$(stat -c %s "$out")
+          sha=$(sha256sum "$out" | cut -d' ' -f1)
+          echo "$sha  $out" > "$out.sha256"
+          echo "$size" > "$out.size.txt"
+          {
+            echo "ARCHIVE=$out"
+            echo "ARCHIVE_SIZE=$size"
+            echo "ARCHIVE_SHA=$sha"
+          } >> "$GITHUB_ENV"
+          echo "archive: $out size=$size sha256=$sha"
+
+      - name: Report
+        run: |
+          set -u
+          before=$(awk -v k="$SIZE_BEFORE_KB" 'BEGIN{printf "%.1f", k/1024}')
+          after=$(awk -v k="$SIZE_AFTER_KB" 'BEGIN{printf "%.1f", k/1024}')
+          dl=$(awk -v b="$ARCHIVE_SIZE" 'BEGIN{printf "%.1f", b/1048576}')
+          release_tag="flutter-sdk-${TAG}-r${PKG_REL}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${ARCHIVE}"
+          maxb=$((ARCHIVE_SIZE * 2))
+          {
+            echo "# Flutter SDK slim: ${TAG} (paket ${PKG_REL})"
+            echo
+            echo "- Sebelum dipangkas: ${before} MiB"
+            echo "- Sesudah dipangkas: ${after} MiB"
+            echo "- **Arsip .tar.xz (unduhan): ${dl} MiB**"
+            echo "- Arsip: ${ARCHIVE}"
+            echo "- Ukuran: ${ARCHIVE_SIZE} byte"
+            echo "- SHA-256: ${ARCHIVE_SHA}"
+            echo "- keep_git: ${KEEP_GIT}"
+            echo
+            echo "## Yang dibuang"
+            echo '```'
+            cat removed.txt
+            echo '```'
+            echo
+            echo "## Entri untuk catalog.json"
+            echo '```json'
+            echo "{"
+            echo "  \"id\": \"flutter-sdk-${TAG}\","
+            echo "  \"version\": \"Flutter ${TAG} for Android arm64 (repackaged from flutter-for-termux ${TAG}-${PKG_REL})\","
+            echo "  \"url\": \"${url}\","
+            echo "  \"installPath\": \"${ARCHIVE}\","
+            echo "  \"sha256\": \"${ARCHIVE_SHA}\","
+            echo "  \"license\": \"BSD-3-Clause (Flutter)\","
+            echo "  \"abi\": \"arm64-v8a\","
+            echo "  \"archive\": \"tar.xz\","
+            echo "  \"maxBytes\": ${maxb}"
+            echo "}"
+            echo '```'
+          } > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          cat report.md
+          {
+            echo "Flutter SDK ${TAG} for Android arm64, dipangkas untuk build APK di Studio Mobile."
+            echo
+            echo "Sumber: GeneralKaos666/flutter-for-termux, rilis ${TAG}, file ${DEB}"
+            echo "- SHA-256 deb sumber: ${DEB_SHA}"
+            echo "- Ukuran deb sumber: ${DEB_SIZE} byte"
+            echo
+            echo "Flutter berlisensi BSD-3-Clause. Biner dan patch Termux berasal dari repo sumber di atas; skrip pengemasan repo itu berlisensi GPL-3.0."
+            echo
+            echo "SHA-256 arsip: ${ARCHIVE_SHA}"
+          } > notes.md
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          files=("$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.size.txt")
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" --notes-file notes.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" \
+              --title "Flutter SDK ${TAG} (Android arm64, slim)" \
+              --notes-file notes.md \
+              --target "$GITHUB_SHA" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "Released: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
