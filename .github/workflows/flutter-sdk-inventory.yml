@@ -1,0 +1,149 @@
+name: Flutter SDK inventory
+
+# Tahap 1: unduh flutter_<tag>-<rel>_aarch64.deb, verifikasi SHA-256 + ukuran,
+# lalu laporkan isi dan ukurannya. Tidak menjalankan binary (hanya analisis statis).
+# Letakkan di .github/workflows/ lalu jalankan manual (Actions > Run workflow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag rilis Flutter (juga nama release di GitHub)"
+        default: "3.47.7"
+        required: true
+      pkg_rel:
+        description: "Revisi paket (angka setelah tanda minus)"
+        default: "6"
+        required: true
+      sha256:
+        description: "SHA-256 yang diharapkan (dari INSTALL_GUIDE.md repo; ganti bila revisi lain)"
+        default: "3f62be6aad385092b3c4dd760080279c4b78ab292822c3fec8ba764eb88208a6"
+        required: true
+      size:
+        description: "Ukuran yang diharapkan, dalam byte"
+        default: "635042964"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag }}
+      PKG_REL: ${{ inputs.pkg_rel }}
+      EXPECTED_SHA: ${{ inputs.sha256 }}
+      EXPECTED_SIZE: ${{ inputs.size }}
+    steps:
+      - name: Download and verify the deb
+        run: |
+          set -euo pipefail
+          deb="flutter_${TAG}-${PKG_REL}_aarch64.deb"
+          url="https://github.com/GeneralKaos666/flutter-for-termux/releases/download/${TAG}/${deb}"
+          echo "Downloading $url"
+          curl -fSL --retry 3 --retry-delay 5 -o "$deb" "$url"
+          actual_size=$(stat -c %s "$deb")
+          actual_sha=$(sha256sum "$deb" | cut -d' ' -f1)
+          echo "size   expected=$EXPECTED_SIZE actual=$actual_size"
+          echo "sha256 expected=$EXPECTED_SHA"
+          echo "sha256 actual  =$actual_sha"
+          [ "$actual_size" = "$EXPECTED_SIZE" ] || { echo "::error::Size mismatch"; exit 1; }
+          [ "$actual_sha" = "$EXPECTED_SHA" ] || { echo "::error::SHA-256 mismatch"; exit 1; }
+          echo "DEB=$deb" >> "$GITHUB_ENV"
+
+      - name: Extract
+        run: |
+          set -euo pipefail
+          mkdir sdk
+          dpkg-deb -x "$DEB" sdk
+          root="sdk/data/data/com.termux/files/usr/opt/flutter"
+          test -d "$root" || { echo "::error::Flutter root not found at $root"; find sdk -maxdepth 6 -type d | head -40; exit 1; }
+          echo "ROOT=$root" >> "$GITHUB_ENV"
+          du -sh sdk
+
+      - name: Report - sizes
+        run: |
+          set -uo pipefail
+          {
+            echo "# Flutter SDK inventory: $DEB"
+            echo
+            echo "Deb: $(stat -c %s "$DEB") bytes"
+            echo "Extracted total: $(du -sk sdk | cut -f1 | awk '{printf "%.1f MiB", $1/1024}')"
+            echo
+            echo "## Largest directories (MiB, depth 4 under flutter root)"
+            echo '```'
+            du -k --max-depth=4 "$ROOT" | sort -rn | head -40 | awk '{printf "%8.1f  %s\n", $1/1024, $2}' | sed "s#$ROOT#<root>#"
+            echo '```'
+            echo
+            echo "## Largest files (MiB)"
+            echo '```'
+            find sdk -type f -printf '%s %p\n' | sort -rn | head -30 | awk '{printf "%8.1f  %s\n", $1/1048576, $2}' | sed "s#$ROOT#<root>#"
+            echo '```'
+            echo
+            echo "## Engine artifact folders"
+            echo '```'
+            ls -1 "$ROOT/bin/cache/artifacts/engine" 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo "## Android-related paths"
+            echo '```'
+            find "$ROOT/bin/cache" -iname '*android*' -maxdepth 6 2>/dev/null | sed "s#$ROOT#<root>#" | head -30
+            echo '```'
+          } > report.md
+
+      - name: Report - ELF binaries (interpreter, dependencies, hardcoded Termux paths)
+        run: |
+          set -uo pipefail
+          {
+            echo
+            echo "## ELF binaries"
+            echo "Kolom: ukuran MiB | interpreter | jumlah string 'com.termux' | path"
+            echo '```'
+            find "$ROOT" -type f -size +1k -exec file {} + 2>/dev/null \
+              | grep -E ': ELF ' | cut -d: -f1 | sort | while read -r f; do
+                size=$(stat -c %s "$f" | awk '{printf "%.1f", $1/1048576}')
+                interp=$(readelf -l "$f" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)\]/\1/p' | head -1)
+                termux=$(grep -a -o 'com\.termux' "$f" 2>/dev/null | wc -l)
+                echo "$size | ${interp:-none} | $termux | ${f#$ROOT/}"
+              done | head -80
+            echo '```'
+            echo
+            echo "## Shared-library dependencies (NEEDED) of key binaries"
+            for f in \
+              "$ROOT/bin/cache/dart-sdk/bin/dart" \
+              "$ROOT/bin/cache/artifacts/engine/linux-arm64/gen_snapshot" \
+              "$ROOT/bin/cache/artifacts/engine/linux-arm64/impellerc" \
+              "$ROOT/bin/cache/artifacts/engine/linux-arm64/const_finder.dart.snapshot"; do
+              [ -f "$f" ] || { echo "- missing: ${f#$ROOT/}"; continue; }
+              echo
+              echo "**${f#$ROOT/}**"
+              echo '```'
+              readelf -d "$f" 2>/dev/null | grep -E 'NEEDED|RPATH|RUNPATH' || echo "(not an ELF or no dynamic section)"
+              echo '```'
+            done
+          } >> report.md
+
+      - name: Report - text files that mention com.termux
+        run: |
+          set -uo pipefail
+          {
+            echo
+            echo "## Non-binary files that mention com.termux (first 60)"
+            echo '```'
+            grep -rIl 'com\.termux' "$ROOT" 2>/dev/null | sed "s#$ROOT#<root>#" | head -60
+            echo '```'
+          } >> report.md
+
+      - name: Publish report
+        run: |
+          # GITHUB_STEP_SUMMARY is limited to 1 MiB; the report stays far below that.
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          wc -c report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-sdk-inventory
+          path: report.md
