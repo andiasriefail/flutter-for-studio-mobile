@@ -71,13 +71,14 @@ jobs:
           mkdir sdk
           dpkg-deb -x "$DEB" sdk
           root="sdk/data/data/com.termux/files/usr/opt/flutter"
-          test -d "$root" || { echo "::error::Flutter root not found at $root"; find sdk -maxdepth 6 -type d | head -40; exit 1; }
+          test -d "$root" || { echo "::error::Flutter root not found at $root"; find sdk -maxdepth 6 -type d | sed -n '1,40p'; exit 1; }
           echo "ROOT=$root" >> "$GITHUB_ENV"
           du -sh sdk
 
       - name: Report - sizes
         run: |
-          set -uo pipefail
+          set -u
+          set +e
           {
             echo "# Flutter SDK inventory: $DEB"
             echo
@@ -86,12 +87,12 @@ jobs:
             echo
             echo "## Largest directories (MiB, depth 4 under flutter root)"
             echo '```'
-            du -k --max-depth=4 "$ROOT" | sort -rn | head -40 | awk '{printf "%8.1f  %s\n", $1/1024, $2}' | sed "s#$ROOT#<root>#"
+            du -k --max-depth=4 "$ROOT" | sort -rn | sed -n '1,40p' | awk '{printf "%8.1f  %s\n", $1/1024, $2}' | sed "s#$ROOT#<root>#"
             echo '```'
             echo
             echo "## Largest files (MiB)"
             echo '```'
-            find sdk -type f -printf '%s %p\n' | sort -rn | head -30 | awk '{printf "%8.1f  %s\n", $1/1048576, $2}' | sed "s#$ROOT#<root>#"
+            find sdk -type f -printf '%s %p\n' | sort -rn | sed -n '1,30p' | awk '{printf "%8.1f  %s\n", $1/1048576, $2}' | sed "s#$ROOT#<root>#"
             echo '```'
             echo
             echo "## Engine artifact folders"
@@ -101,13 +102,14 @@ jobs:
             echo
             echo "## Android-related paths"
             echo '```'
-            find "$ROOT/bin/cache" -iname '*android*' -maxdepth 6 2>/dev/null | sed "s#$ROOT#<root>#" | head -30
+            find "$ROOT/bin/cache" -iname '*android*' -maxdepth 6 2>/dev/null | sed "s#$ROOT#<root>#" | sed -n '1,30p'
             echo '```'
           } > report.md
 
       - name: Report - ELF binaries (interpreter, dependencies, hardcoded Termux paths)
         run: |
-          set -uo pipefail
+          set -u
+          set +e
           {
             echo
             echo "## ELF binaries"
@@ -119,7 +121,7 @@ jobs:
                 interp=$(readelf -l "$f" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)\]/\1/p' | head -1)
                 termux=$(grep -a -o 'com\.termux' "$f" 2>/dev/null | wc -l)
                 echo "$size | ${interp:-none} | $termux | ${f#$ROOT/}"
-              done | head -80
+              done | sed -n '1,80p'
             echo '```'
             echo
             echo "## Shared-library dependencies (NEEDED) of key binaries"
@@ -139,12 +141,13 @@ jobs:
 
       - name: Report - text files that mention com.termux
         run: |
-          set -uo pipefail
+          set -u
+          set +e
           {
             echo
             echo "## Non-binary files that mention com.termux (first 60)"
             echo '```'
-            grep -rIl 'com\.termux' "$ROOT" 2>/dev/null | sed "s#$ROOT#<root>#" | head -60
+            grep -rIl 'com\.termux' "$ROOT" 2>/dev/null | sed "s#$ROOT#<root>#" | sed -n '1,60p'
             echo '```'
           } >> report.md
 
