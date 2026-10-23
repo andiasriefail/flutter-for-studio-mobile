@@ -16,13 +16,13 @@ on:
         default: "6"
         required: true
       sha256:
-        description: "SHA-256 yang diharapkan (dari INSTALL_GUIDE.md repo; ganti bila revisi lain)"
-        default: "3f62be6aad385092b3c4dd760080279c4b78ab292822c3fec8ba764eb88208a6"
-        required: true
+        description: "(Opsional) SHA-256 yang ingin Anda pin. Kosong = pakai file .sha256 dari rilis"
+        default: ""
+        required: false
       size:
-        description: "Ukuran yang diharapkan, dalam byte"
-        default: "635042964"
-        required: true
+        description: "(Opsional) Ukuran dalam byte yang ingin Anda pin. Kosong = pakai file .size.txt dari rilis"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -41,16 +41,28 @@ jobs:
         run: |
           set -euo pipefail
           deb="flutter_${TAG}-${PKG_REL}_aarch64.deb"
-          url="https://github.com/GeneralKaos666/flutter-for-termux/releases/download/${TAG}/${deb}"
-          echo "Downloading $url"
-          curl -fSL --retry 3 --retry-delay 5 -o "$deb" "$url"
+          base="https://github.com/GeneralKaos666/flutter-for-termux/releases/download/${TAG}"
+          echo "Downloading $base/$deb"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$deb" "$base/$deb"
+          curl -fsSL --retry 3 -o "$deb.sha256" "$base/$deb.sha256"
+          curl -fsSL --retry 3 -o "$deb.size.txt" "$base/$deb.size.txt"
           actual_size=$(stat -c %s "$deb")
           actual_sha=$(sha256sum "$deb" | cut -d' ' -f1)
-          echo "size   expected=$EXPECTED_SIZE actual=$actual_size"
-          echo "sha256 expected=$EXPECTED_SHA"
-          echo "sha256 actual  =$actual_sha"
-          [ "$actual_size" = "$EXPECTED_SIZE" ] || { echo "::error::Size mismatch"; exit 1; }
-          [ "$actual_sha" = "$EXPECTED_SHA" ] || { echo "::error::SHA-256 mismatch"; exit 1; }
+          rel_sha=$(grep -oE '[0-9a-f]{64}' "$deb.sha256" | head -1)
+          rel_size=$(tr -dc '0-9' < "$deb.size.txt")
+          echo "actual   size=$actual_size sha256=$actual_sha"
+          echo "release  size=$rel_size sha256=$rel_sha"
+          {
+            echo "## Nilai untuk di-pin"
+            echo "- file: $deb"
+            echo "- size: $actual_size"
+            echo "- sha256: $actual_sha"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$actual_sha" = "$rel_sha" ] || { echo "::error::SHA-256 differs from the release .sha256 file"; exit 1; }
+          [ "$actual_size" = "$rel_size" ] || { echo "::error::Size differs from the release .size.txt file"; exit 1; }
+          if [ -n "$EXPECTED_SHA" ] && [ "$actual_sha" != "$EXPECTED_SHA" ]; then echo "::error::SHA-256 differs from the input value"; exit 1; fi
+          if [ -n "$EXPECTED_SIZE" ] && [ "$actual_size" != "$EXPECTED_SIZE" ]; then echo "::error::Size differs from the input value"; exit 1; fi
           echo "DEB=$deb" >> "$GITHUB_ENV"
 
       - name: Extract
